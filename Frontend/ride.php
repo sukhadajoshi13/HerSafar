@@ -1,0 +1,584 @@
+<?php
+ini_set('display_errors',1);
+error_reporting(E_ALL);
+
+require_once 'dbcon.php';
+require_once 'functions.php';
+
+if (session_status() === PHP_SESSION_NONE) session_start();
+
+// Current user (may be 0 for guests)
+$uid = (int)($_SESSION['user']['id'] ?? 0);
+$role = $_SESSION['user']['role'] ?? null;
+
+$csrf = csrf_token();
+
+// ------------------------
+// Resolve share token (if provided) or use id
+// ------------------------
+$ride_id = 0;
+$share_token = trim((string)($_GET['share'] ?? $_GET['token'] ?? ''));
+
+if ($share_token !== '') {
+    // normalize token
+    $share_token = preg_replace('/[^0-9A-Za-z_\-]/', '', $share_token);
+
+    // try rides.share_token
+    $stmt = $mysqli->prepare("SELECT id FROM rides WHERE share_token = ? LIMIT 1");
+    if ($stmt) {
+        $stmt->bind_param('s', $share_token);
+        $stmt->execute();
+        $r = $stmt->get_result()->fetch_assoc();
+        $stmt->close();
+        if ($r) $ride_id = (int)$r['id'];
+    }
+
+    // if not found, try ride_shares table (may contain group_id/expires)
+    if ($ride_id === 0) {
+        $stmt = $mysqli->prepare("SELECT rs.ride_id, rs.group_id, rs.expires_at FROM ride_shares rs WHERE rs.token = ? LIMIT 1");
+        if ($stmt) {
+            $stmt->bind_param('s', $share_token);
+            $stmt->execute();
+            $srow = $stmt->get_result()->fetch_assoc();
+            $stmt->close();
+            if ($srow) {
+                // expiry check
+                if (!empty($srow['expires_at']) && strtotime($srow['expires_at']) < time()) {
+                    set_flash('error','This share link has expired.');
+                    header('Location: dashboard.php'); exit;
+                }
+                // group restricted -> check membership
+                if (!empty($srow['group_id'])) {
+                    if (empty($uid)) {
+                        // request login first
+                        $_SESSION['_join_after_share'] = $share_token;
+                        set_flash('info','Please login to access this shared ride.');
+                        header('Location: login.php'); exit;
+                    } else {
+                        $stmt2 = $mysqli->prepare("SELECT id FROM group_members WHERE group_id = ? AND user_id = ? LIMIT 1");
+                        $stmt2->bind_param('ii', $srow['group_id'], $uid);
+                        $stmt2->execute();
+                        $mem = $stmt2->get_result()->fetch_assoc();
+                        $stmt2->close();
+                        if (!$mem) {
+                            set_flash('error','Ride is shared with a group — join that group to view the ride.');
+                            header('Location: group.php?id=' . (int)$srow['group_id']); exit;
+                        }
+                    }
+                }
+                $ride_id = (int)$srow['ride_id'];
+            }
+        }
+    }
+
+    // not resolved
+    if ($ride_id === 0) {
+        echo '<!doctype html><html><head><meta charset="utf-8"><title>Invalid share</title></head><body style="font-family:Arial;padding:18px">';
+        echo '<h2>Invalid or expired share link</h2>';
+        echo '<p>The share token could not be resolved to a ride.</p>';
+        echo '<p><a href="dashboard.php">Back to dashboard</a></p>';
+        echo '</body></html>';
+        exit;
+    }
+} else {
+    $ride_id = (int)($_GET['id'] ?? 0);
+    if ($ride_id <= 0) {
+        echo '<!doctype html><html><head><meta charset="utf-8"><title>Invalid ride id</title></head><body style="font-family:Arial;padding:18px">';
+        echo '<h2>Invalid ride id.</h2>';
+        echo '<p>Please open the ride from the dashboard or a valid share link.</p>';
+        echo '<p><a href="dashboard.php">Back to dashboard</a></p>';
+        echo '</body></html>';
+        exit;
+    }
+}
+
+// ------------------------
+// Load ride + driver info
+// ------------------------
+$stmt = $mysqli->prepare("
+    SELECT r.*, u.id AS driver_id, u.name AS driver_name, u.email AS driver_email, u.phone AS driver_phone,
+           u.vehicle_make, u.vehicle_model, u.vehicle_number, u.bio
+    FROM rides r
+    JOIN users u ON r.driver_id = u.id
+    WHERE r.id = ? LIMIT 1
+");
+$stmt->bind_param('i', $ride_id);
+$stmt->execute();
+$ride = $stmt->get_result()->fetch_assoc();
+$stmt->close();
+
+if (!$ride) {
+    echo '<!doctype html><html><head><meta charset="utf-8"><title>Ride not found</title></head><body style="font-family:Arial;padding:18px">';
+    echo '<h2>Ride not found.</h2>';
+    echo '<p>The ride you are looking for does not exist.</p>';
+    echo '<p><a href="dashboard.php">Back to dashboard</a></p>';
+    echo '</body></html>';
+    exit;
+}
+
+// ------------------------
+// Bookings summary (counts)
+ // ------------------------
+$counts = ['pending'=>0,'confirmed'=>0,'cancelled'=>0];
+$stmt = $mysqli->prepare("SELECT status, SUM(seats) AS seats_sum FROM bookings WHERE ride_id = ? GROUP BY status");
+$stmt->bind_param('i', $ride_id);
+$stmt->execute();
+$res = $stmt->get_result();
+while ($r = $res->fetch_assoc()) $counts[$r['status']] = (int)$r['seats_sum'];
+$stmt->close();
+
+$stmt = $mysqli->prepare("SELECT SUM(seats) AS confirmed_seats FROM bookings WHERE ride_id = ? AND status = 'confirmed'");
+$stmt->bind_param('i', $ride_id);
+$stmt->execute();
+$res = $stmt->get_result();
+$row = $res->fetch_assoc();
+$confirmed_seats = (int)($row['confirmed_seats'] ?? 0);
+$stmt->close();
+
+// ------------------------
+// Bookings list for driver/admin
+// ------------------------
+$bookings = [];
+if ($uid && ($uid === (int)$ride['driver_id'] || $role === 'admin')) {
+    $stmt = $mysqli->prepare("
+        SELECT b.id, b.user_id, b.seats, b.status, b.created_at, u.name AS passenger_name, u.email AS passenger_email, u.phone AS passenger_phone
+        FROM bookings b
+        JOIN users u ON b.user_id = u.id
+        WHERE b.ride_id = ?
+        ORDER BY FIELD(b.status,'pending','confirmed','cancelled'), b.created_at ASC
+    ");
+    $stmt->bind_param('i', $ride_id);
+    $stmt->execute();
+    $res = $stmt->get_result();
+    while ($r = $res->fetch_assoc()) $bookings[] = $r;
+    $stmt->close();
+}
+
+// ------------------------
+// Current user's booking (if any)
+// ------------------------
+$my_booking = null;
+if ($uid) {
+    $stmt = $mysqli->prepare("SELECT id, seats, status, created_at FROM bookings WHERE ride_id = ? AND user_id = ? LIMIT 1");
+    $stmt->bind_param('ii', $ride_id, $uid);
+    $stmt->execute();
+    $my_booking = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+}
+
+// ------------------------
+// Recent messages to user
+// ------------------------
+$messages = [];
+if ($uid) {
+    $stmt = $mysqli->prepare("SELECT id, sender_id, message, sent_at FROM messages WHERE receiver_id = ? ORDER BY sent_at DESC LIMIT 10");
+    $stmt->bind_param('i', $uid);
+    $stmt->execute();
+    $res = $stmt->get_result();
+    while ($m = $res->fetch_assoc()) $messages[] = $m;
+    $stmt->close();
+}
+
+// ------------------------
+// Flash
+// ------------------------
+$flash = '';
+if (!empty($_SESSION['msg'])) {
+    $m = $_SESSION['msg'];
+    $flash = "<div style=\"" . ($m['type']==='success' ? 'color:green' : 'color:red') . ";margin-bottom:12px\">" . htmlspecialchars($m['text']) . "</div>";
+    unset($_SESSION['msg']);
+}
+
+// ------------------------
+// Generated links from session (post_ride results)
+ // ------------------------
+$generated_links = $_SESSION['last_generated_share_links'] ?? null;
+if (!empty($generated_links)) unset($_SESSION['last_generated_share_links']);
+?>
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Ride #<?= (int)$ride['id']; ?> — HerSafar</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root{
+      --bg-a:#fbf9ff; --bg-b:#f7f3ff;
+      --primary-1:#5b21b6; --primary-2:#8b5cf6; --accent:#c084fc;
+      --muted:#6b4a86; --card:#ffffff;
+      --radius:12px; --shadow:0 18px 50px rgba(91,33,182,0.06);
+      font-family: 'Poppins', system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+      color-scheme: light;
+    }
+    *{box-sizing:border-box}
+   html,body{height:100%;margin:0}
+/* Reset + layout helpers (match about_us.php) */
+html, body {
+  height: 100%;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  -webkit-font-smoothing: antialiased;
+  background:
+    radial-gradient(700px 300px at 8% 8%, rgba(139,92,246,0.03), transparent 12%),
+    radial-gradient(600px 260px at 92% 92%, rgba(192,132,252,0.02), transparent 12%),
+    linear-gradient(180deg,var(--bg-a),var(--bg-b));
+  color: var(--text);
+}
+
+/* Keep gutters consistent with header */
+:root { --gutter:22px; }
+
+/* main container aligns with header gutters */
+main.container{
+  width: calc(100% - (var(--gutter) * 2));
+  max-width: var(--max-width);
+  margin: 26px var(--gutter);
+  padding: 18px;
+  box-sizing: border-box;
+  flex: 1 0 auto; /* expand so footer is pushed to bottom */
+}
+
+  /* ====== Card + container (final, centered, roomy enough) ====== */
+.wrap,
+main.container {
+  width: 100%;
+  max-width: 100%;
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+  overflow: visible;
+}
+
+/* Centered card: roomy enough for inner layout */
+.card {
+  width: calc(100% - 44px);   /* same gutters as header/footer (22px each side) */
+  max-width: 1100px;          /* roomy enough for two-column content */
+  margin: 20px auto;          /* top gap + center horizontally */
+  background: linear-gradient(180deg, rgba(255,255,255,0.72), rgba(255,255,255,0.6));
+  border-radius: var(--radius);
+  padding: 22px;
+  box-shadow: var(--shadow);
+  border: 1px solid rgba(15,23,42,0.04);
+  backdrop-filter: blur(8px) saturate(120%);
+  box-sizing: border-box;
+  overflow: visible;
+}
+
+/* Responsive inner grid */
+.grid {
+  display: grid;
+  gap: 18px;
+  grid-template-columns: 1fr minmax(240px, 360px);
+  align-items: start;
+}
+@media (max-width: 980px) {
+  .card { width: calc(100% - 28px); margin: 20px auto; padding:18px; }
+  .grid { grid-template-columns: 1fr; }
+}
+
+/* Safety rules for inner contents */
+.card table {
+  width: 100%;
+  border-collapse: collapse;
+  overflow: auto;
+  display: block;
+  max-width: 100%;
+}
+    .topbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:18px}
+    .back{font-size:14px;color:var(--muted);text-decoration:none}
+    .title{font-size:20px;color:var(--primary-1);font-weight:700;margin:0}
+    .subtitle{color:var(--muted);font-size:13px;margin-top:4px}
+
+    .grid{display:grid;grid-template-columns:1fr 360px;gap:18px}
+    @media(max-width:980px){ .grid{grid-template-columns:1fr} }
+
+    .section{background:#fff;border-radius:10px;padding:16px;border:1px solid rgba(15,23,42,0.04)}
+    .row{display:flex;gap:12px;align-items:center}
+    .route{font-weight:800;font-size:18px;color:#241235}
+    .meta{color:var(--muted);font-size:13px}
+    .pill{display:inline-block;padding:6px 10px;border-radius:999px;font-weight:700;font-size:13px}
+    .badge-available{background:#eef2ff;color:#1e3a8a}
+    .badge-pending{background:#fff7ed;color:#92400e}
+    .badge-confirm{background:#ecfdf5;color:#065f46}
+
+    .driver-card{display:flex;gap:12px;align-items:center}
+    .avatar{width:56px;height:56px;border-radius:12px;background:linear-gradient(135deg,var(--primary-2),var(--accent));display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700;font-size:18px}
+    .driver-info{font-size:14px}
+    .driver-info .name{font-weight:700;color:#241235}
+    .driver-info .sub{color:var(--muted);font-size:13px;margin-top:2px}
+
+    table{width:100%;border-collapse:collapse;margin-top:12px}
+    th,td{padding:10px 8px;border-bottom:1px solid #f1f5f9;text-align:left;font-size:14px}
+    th{background:rgba(139,92,246,0.04);font-weight:700;color:#241235}
+
+    .form-inline{display:flex;gap:10px;align-items:center}
+    select.input, input.input{padding:10px;border-radius:8px;border:1px solid rgba(99,102,241,0.06);background:#fff}
+    .btn{padding:10px 14px;border-radius:8px;border:0;cursor:pointer;font-weight:700}
+    .btn.primary{background:linear-gradient(90deg,var(--primary-2),var(--primary-1));color:#fff}
+    .btn.ghost{background:transparent;border:1px solid rgba(15,23,42,0.06);color:#241235}
+
+    .side{display:flex;flex-direction:column;gap:12px}
+    .card-small{background:#fbfdff;padding:12px;border-radius:10px;border:1px solid rgba(15,23,42,0.04)}
+    .link-row{display:flex;gap:8px;align-items:center;margin-top:8px}
+    .link-row input{flex:1;padding:8px;border-radius:8px;border:1px solid #eef2ff;background:#fff}
+    .copybtn{padding:8px 10px;border-radius:8px;border:0;background:#10b981;color:#fff;font-weight:700;cursor:pointer}
+    .small{font-size:13px;color:var(--muted)}
+
+    .messages{background:linear-gradient(180deg,#fff,#fbfbff);padding:10px;border-radius:8px;border:1px solid rgba(15,23,42,0.03)}
+    .msg-item{padding:8px;border-bottom:1px solid #f1f5f9}
+    .muted{color:var(--muted)}
+
+    .footer{margin-top:12px;text-align:center;color:var(--muted);font-size:13px}
+  </style>
+</head>
+<body>
+  <?php include 'header.php' ?>
+  <div class="wrap">
+    <div class="card" role="main" aria-labelledby="ride-heading">
+
+      <div class="topbar">
+        <div>
+          <a class="back" href="search_results.php">← Back to Search Rides</a>
+          </div>
+
+        <div style="text-align:right">
+          <div style="margin-top:6px">
+            <span class="pill badge-available">Available: <?= (int)$ride['available_seats']; ?></span>
+            <span style="margin-left:8px" class="pill badge-confirm">Confirmed: <?= (int)$confirmed_seats; ?></span>
+          </div>
+        </div>
+      </div>
+
+      <div class="grid">
+
+        <!-- LEFT -->
+        <div>
+          <div class="section" aria-labelledby="details-title">
+            <div class="row" style="justify-content:space-between">
+              <div>
+                <div class="route"><?= htmlspecialchars($ride['from_location']) ?> → <?= htmlspecialchars($ride['to_location']) ?></div>
+                <div class="meta" style="margin-top:6px">Price: <strong>₹<?= htmlspecialchars($ride['price']) ?></strong> • Seats: <strong><?= (int)$ride['seats'] ?></strong></div>
+              </div>
+            </div>
+
+            <hr style="margin:12px 0;border:none;border-top:1px solid #f3f4f6">
+
+            <div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start">
+              <div style="flex:1;margin-right:12px">
+                <h3 style="margin:0 0 8px 0">Driver</h3>
+                <div class="driver-card">
+                  <div class="avatar" aria-hidden="true"><?= htmlspecialchars(substr($ride['driver_name'],0,1)); ?></div>
+                  <div class="driver-info">
+                    <div class="name"><?= htmlspecialchars($ride['driver_name']); ?></div>
+                    <div class="sub"><?= htmlspecialchars($ride['driver_phone'] ?? ''); ?></div>
+                    <div class="small" style="margin-top:6px">
+                      <?= htmlspecialchars(trim($ride['vehicle_make'] . ' ' . $ride['vehicle_model'] . ' ' . $ride['vehicle_number'])); ?>
+                    </div>
+                  </div>
+                </div>
+
+                <?php if (!empty($ride['bio'])): ?>
+                  <div style="margin-top:12px" class="muted"><?= nl2br(htmlspecialchars($ride['bio'])); ?></div>
+                <?php endif; ?>
+              </div>
+
+              <div style="width:240px">
+                <div class="section" style="padding:12px">
+                  <div style="font-weight:700">Bookings summary</div>
+                  <div class="small" style="margin-top:8px">Pending: <?= (int)$counts['pending']; ?></div>
+                  <div class="small">Confirmed: <?= (int)$confirmed_seats; ?></div>
+                  <div class="small">Cancelled: <?= (int)$counts['cancelled']; ?></div>
+                </div>
+
+                <?php if ($uid && ($uid === (int)$ride['driver_id'] || $role === 'admin')): ?>
+                  <div style="margin-top:12px" class="small muted">Driver controls available below.</div>
+                <?php endif; ?>
+              </div>
+            </div>
+          </div>
+
+          <!-- bookings / booking form -->
+          <div class="section" style="margin-top:14px">
+            <?php if ($uid && ($uid === (int)$ride['driver_id'] || $role === 'admin')): ?>
+              <h3 style="margin:0 0 10px 0">Booking requests</h3>
+              <?php if (empty($bookings)): ?>
+                <div class="muted">No booking requests yet.</div>
+              <?php else: ?>
+                <table aria-describedby="booking-requests">
+                  <thead>
+                    <tr><th>ID</th><th>Passenger</th><th>Contact</th><th>Seats</th><th>Status</th><th>Requested</th><th>Actions</th></tr>
+                  </thead>
+                  <tbody>
+                    <?php foreach($bookings as $b): ?>
+                      <tr>
+                        <td><?= (int)$b['id']; ?></td>
+                        <td><?= htmlspecialchars($b['passenger_name']); ?></td>
+                        <td class="small"><?= htmlspecialchars($b['passenger_email']); ?> | <?= htmlspecialchars($b['passenger_phone']); ?></td>
+                        <td><?= (int)$b['seats']; ?></td>
+                        <td>
+                          <?php if ($b['status'] === 'confirmed'): ?>
+                            <span class="pill badge-confirm">Confirmed</span>
+                          <?php elseif ($b['status'] === 'pending'): ?>
+                            <span class="pill badge-pending">Pending</span>
+                          <?php else: ?>
+                            <span class="small muted">Cancelled</span>
+                          <?php endif; ?>
+                        </td>
+                        <td class="small"><?= htmlspecialchars($b['created_at']); ?></td>
+                        <td>
+                          <?php if ($b['status'] === 'pending'): ?>
+                            <form method="POST" action="booking_actions.php" style="display:inline">
+                              <input type="hidden" name="csrf" value="<?= htmlspecialchars($csrf); ?>">
+                              <input type="hidden" name="action" value="confirm">
+                              <input type="hidden" name="booking_id" value="<?= (int)$b['id']; ?>">
+                              <button class="btn primary" type="submit" onclick="return confirm('Confirm this booking?')">Confirm</button>
+                            </form>
+                            <form method="POST" action="booking_actions.php" style="display:inline;margin-left:6px">
+                              <input type="hidden" name="csrf" value="<?= htmlspecialchars($csrf); ?>">
+                              <input type="hidden" name="action" value="cancel">
+                              <input type="hidden" name="booking_id" value="<?= (int)$b['id']; ?>">
+                              <button class="btn ghost" type="submit" onclick="return confirm('Cancel this booking?')">Cancel</button>
+                            </form>
+                          <?php else: ?>
+                            <span class="small muted">—</span>
+                          <?php endif; ?>
+                        </td>
+                      </tr>
+                    <?php endforeach; ?>
+                  </tbody>
+                </table>
+              <?php endif; ?>
+
+            <?php else: /* passenger/public view */ ?>
+
+            <?php if ($my_booking): ?>
+              <h3 style="margin:0 0 10px 0">Your booking</h3>
+              <div class="small">Seats: <strong><?= (int)$my_booking['seats']; ?></strong></div>
+              <div class="small" style="margin-top:6px">Status: <strong><?= htmlspecialchars(ucfirst($my_booking['status'])); ?></strong></div>
+              <div style="margin-top:8px">
+                <?php if ($my_booking['status'] === 'pending'): ?>
+                  <div style="display:inline-block;background:#ecfdf5;color:#065f46;font-weight:700;padding:8px 12px;border-radius:8px;box-shadow:0 6px 18px rgba(6,95,70,0.06);">
+                    Your booking is pending driver confirmation.
+                  </div>
+                <?php elseif ($my_booking['status'] === 'confirmed'): ?>
+                  <div style="display:inline-block;background:#ecfdf5;color:#065f46;font-weight:700;padding:8px 12px;border-radius:8px;box-shadow:0 6px 18px rgba(6,95,70,0.06);">
+                    Booking confirmed — contact the driver if needed.
+                  </div>
+                <?php else: ?>
+                  <div class="small">Booking cancelled.</div>
+                <?php endif; ?>
+              </div>
+            <?php else: ?>
+
+
+                <?php if (empty($uid)): ?>
+                  <div class="muted">Please <a href="login.php">log in</a> to request booking.</div>
+
+                <?php elseif ((int)$ride['available_seats'] <= 0): ?>
+                  <div style="color:#ef4444;font-weight:700">No seats available.</div>
+
+                <?php else: ?>
+                  <h3 style="margin:0 0 10px 0">Request booking</h3>
+                  <form method="POST" action="book_ride.php" class="form-inline" style="align-items:center">
+                    <input type="hidden" name="csrf" value="<?= htmlspecialchars($csrf); ?>">
+                    <input type="hidden" name="ride_id" value="<?= (int)$ride['id']; ?>">
+                    <label class="small" for="seats">Seats</label>
+                    <select id="seats" name="seats" class="input" style="width:96px">
+                      <?php for($i=1;$i<=min(6,(int)$ride['available_seats']);$i++): ?>
+                        <option value="<?= $i; ?>"><?= $i; ?></option>
+                      <?php endfor; ?>
+                    </select>
+                    <button class="btn primary" type="submit" style="margin-left:8px">Book Ride</button>
+                  </form>
+                <?php endif; ?>
+
+              <?php endif; ?>
+
+            <?php endif; ?>
+          </div>
+
+          <!-- Messages -->
+          <div class="section" style="margin-top:14px">
+            <h3 style="margin:0 0 10px 0">Messages</h3>
+            <div class="messages" role="log" aria-live="polite">
+              <?php if (empty($messages)): ?>
+                <div class="muted">No messages yet.</div>
+              <?php else: ?>
+                <?php foreach($messages as $m): ?>
+                  <div class="msg-item">
+                    <div class="small"><?= htmlspecialchars($m['sent_at']); ?></div>
+                    <div><?= nl2br(htmlspecialchars($m['message'])); ?></div>
+                  </div>
+                <?php endforeach; ?>
+              <?php endif; ?>
+            </div>
+          </div>
+        </div>
+
+        <!-- RIGHT -->
+        <aside class="side">
+          <div class="card-small">
+            <div style="font-weight:700">Share this ride</div>
+            <div class="small" style="margin-top:6px">Share links generated when the driver posted the ride appear here.</div>
+
+            <?php if (!empty($generated_links) && is_array($generated_links)): ?>
+              <?php foreach($generated_links as $l): ?>
+                <div style="margin-top:10px">
+                  <div style="font-weight:700;font-size:14px"><?= htmlspecialchars($l['label'] ?? 'Link'); ?></div>
+                  <div class="link-row">
+                    <input type="text" readonly value="<?= htmlspecialchars($l['url'] ?? ''); ?>" id="link-<?= htmlspecialchars($l['token']); ?>">
+                    <button class="copybtn" data-clip="<?= htmlspecialchars($l['url'] ?? ''); ?>">Copy</button>
+                  </div>
+                  <div class="small" style="margin-top:6px">Token: <code><?= htmlspecialchars($l['token'] ?? ''); ?></code><?php if(!empty($l['group_id'])) echo ' • Group: ' . (int)$l['group_id']; ?></div>
+                </div>
+              <?php endforeach; ?>
+            <?php else: ?>
+              <div class="small" style="margin-top:10px">No share links available for this ride.</div>
+            <?php endif; ?>
+          </div>
+
+          <div class="card-small" aria-hidden="false">
+            <div style="font-weight:700">Quick details</div>
+            <div class="small" style="margin-top:8px">
+              <div><strong>Date:</strong> <?= htmlspecialchars($ride['ride_date']); ?></div>
+              <div style="margin-top:6px"><strong>Time:</strong> <?= htmlspecialchars($ride['ride_time'] ?: '—'); ?></div>
+              <div style="margin-top:6px"><strong>Price:</strong> ₹<?= htmlspecialchars($ride['price']); ?></div>
+              <div style="margin-top:6px"><strong>Seats left:</strong> <?= (int)$ride['available_seats']; ?></div>
+            </div>
+          </div>
+
+        </aside>
+
+      </div>
+    </div>
+  </div>
+   <?php include 'footer.php'; ?>
+<script>
+(function(){
+  // copy-to-clipboard for generated links
+  document.addEventListener('click', function(e){
+    if (e.target && e.target.matches('.copybtn')) {
+      var url = e.target.getAttribute('data-clip');
+      if (!url) return;
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(url).then(function(){
+          var prev = e.target.innerText;
+          e.target.innerText = 'Copied';
+          setTimeout(function(){ e.target.innerText = prev; }, 1400);
+        }, function(){ alert('Copy failed — please copy manually.'); });
+      } else {
+        var input = e.target.parentElement.querySelector('input');
+        if (input) {
+          input.select();
+          try { document.execCommand('copy'); e.target.innerText = 'Copied'; setTimeout(function(){ e.target.innerText = 'Copy'; },1400); }
+          catch(err){ alert('Copy not supported — please copy manually.'); }
+        }
+      }
+    }
+  });
+})();
+</script>
+</body>
+</html>
