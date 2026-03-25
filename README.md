@@ -527,36 +527,28 @@ Published strictly for **academic, portfolio, and evaluation purposes**.
 
 ---
 
-## 👩‍💻 Developers
+## 🤝 Contributors
 
-<p align="center">
-  <a href="https://github.com/sakshinikam05">
-    <img src="https://avatars.githubusercontent.com/u/sakshinikam05" width="110" style="border-radius:50%" />
-  </a>
-  &nbsp;&nbsp;&nbsp;&nbsp;
-  <a href="https://github.com/sukhadajoshi13">
-    <img src="https://avatars.githubusercontent.com/u/sukhadajoshi13" width="110" style="border-radius:50%" />
-  </a>
+<table>
+  <tr>
+    <td align="center">
+      <a href="https://github.com/sakshinikam05">
+        <img src="https://github.com/sakshinikam05.png" width="55" style="border-radius:50%;" alt="Sakshi"><br>
+        <sub><b>Sakshi</b></sub>
+      </a>
+    </td>
+    <td align="center">
+      <a href="https://github.com/sukhadajoshi13">
+        <img src="https://github.com/sukhadajoshi13.png" width="55" style="border-radius:50%;" alt="Sukhada"><br>
+        <sub><b>Sukhada</b></sub>
+      </a>
+    </td>
+  </tr>
+</table>
+
+<p>
+  💖 Built with care, collaboration, and a shared vision for women’s safety.
 </p>
-
-<p align="center">
-  <b>Sakshi Sudhir Nikam</b> &nbsp;&nbsp;•&nbsp;&nbsp;
-  <b>Sukhada Deepak Joshi</b>
-</p>
-
-<p align="center">
-  Primary Developer & Project Lead &nbsp;&nbsp;|&nbsp;&nbsp;
-  Contributor & Development Support
-</p>
-
-<p align="center">
-  <a href="https://github.com/sakshinikam05">GitHub</a>
-  &nbsp;&nbsp;•&nbsp;&nbsp;
-  <a href="https://github.com/sukhadajoshi13">GitHub</a>
-</p>
-
-This project was collaboratively developed with a shared commitment to **women’s safety, accountability, and trust**, blending technical expertise with empathy-driven design to create a safer digital mobility platform.
-
 
 ---
 
